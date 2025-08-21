@@ -103,8 +103,8 @@ def compare_weather(
     start_date: str, end_date: str,
     variables: List[str],
     granularity: str = "daily",
-    tz_a: str | None = None,
-    tz_b: str | None = None
+    tz_a: str = "",
+    tz_b: str = ""
 ) -> Dict[str, Any]:
     """
     Fetch Open-Meteo for two locations and compare the first available variable.

@@ -15,7 +15,7 @@ def _fmt_units(var: str, units: Dict[str, str]) -> str:
     return f" {u}" if u else ""
 
 @FunctionTool
-def summarise_weather(user_query: str, openmeteo_response: Dict[str, Any], tz: str | None = None) -> Dict[str, Any]:
+def summarise_weather(user_query: str, openmeteo_response: Dict[str, Any], tz: str = "") -> Dict[str, Any]:
     """
     Build a concise, unit-aware answer. Handles hourly/daily blocks, threshold tests, and basic stats.
     Returns: {"final_answer": str}
