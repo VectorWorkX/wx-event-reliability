@@ -1,221 +1,178 @@
 from __future__ import annotations
-from typing import Dict, Any, List, Tuple
-from datetime import datetime, date, timedelta
+from typing import Dict, Any, List
 import requests
+import datetime as _dt
 from google.adk.tools import FunctionTool
 
-# Import the central mapping from variables.py
+# Import the *impl* (pure helper), not the tool, to avoid tool->tool calls
 try:
-    from .variables import VARIABLE_CONFIG  # same package
+    from .variables import _resolve_variables_impl
 except Exception:
-    # Fallback if relative import fails in some runner
-    from variables import VARIABLE_CONFIG
+    from variables import _resolve_variables_impl
 
-_FORECAST = "https://api.open-meteo.com/v1/forecast"
-_ARCHIVE  = "https://archive-api.open-meteo.com/v1/archive"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+ERA5_URL     = "https://archive-api.open-meteo.com/v1/archive"
 
-# Max forward horizon the forecast API will honor (var-dependent, 7–16).
-# We clamp to 16 days unless caller provides a shorter range.
-_FORECAST_MAX_DAYS = 16
+def _strict_map(canonical: List[str], granularity: str) -> str:
+    """Strict canonical→API param mapping (raises on hourly/daily mismatches)."""
+    res = _resolve_variables_impl(canonical, granularity)
+    return res["api_param"]
 
-def _safe_float(x: Any, lo: float, hi: float) -> bool:
+def _get(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        fx = float(x)
-    except Exception:
-        return False
-    return lo <= fx <= hi
-
-def _pick_granularity(requested: str, time_hint: str) -> str:
-    if requested in {"daily","hourly","minutely_15","current"}:
-        return requested
-    if time_hint == "quarter_hour":
-        return "minutely_15"
-    if time_hint == "clock":
-        return "hourly"
-    # Default to daily to reduce payloads unless the question suggests otherwise
-    return "daily"
-
-def _clamp_forecast_range(s: date, e: date, today: date) -> Tuple[date, date]:
-    if e > today + timedelta(days=_FORECAST_MAX_DAYS):
-        e = today + timedelta(days=_FORECAST_MAX_DAYS)
-    return s, e
-
-def _map_vars(canonical: List[str], granularity: str) -> Tuple[str, List[str], List[str]]:
-    warnings: List[str] = []
-    api_key = granularity if granularity in {"hourly","daily","minutely_15","current"} else "daily"
-    out: List[str] = []
-
-    # Use VARIABLE_CONFIG to produce correct parameter names
-    for v in (canonical or []):
-        cfg = VARIABLE_CONFIG.get(v, {})
-        if api_key == "daily":
-            params = cfg.get("daily", [])
-            if not params:
-                # Fall back to hourly if no daily aggregate exists
-                api_key = "hourly"
-                params = cfg.get("hourly", [])
-                if params:
-                    warnings.append(f"No daily aggregate for '{v}'. Falling back to hourly.")
-            out += params or [v]
-        elif api_key == "hourly":
-            params = cfg.get("hourly", [])
-            if not params and cfg.get("daily"):
-                # Rare: only daily exists, fall back with warning
-                api_key = "daily"
-                params = cfg.get("daily", [])
-                warnings.append(f"No hourly variable for '{v}'. Using daily aggregate.")
-            out += params or [v]
-        else:
-            # For 15-min or current, reuse hourly lists when available
-            params = cfg.get("hourly", []) or cfg.get("daily", [])
-            out += params or [v]
-
-    # Deduplicate while preserving order
-    seen = set()
-    deduped = []
-    for p in out:
-        if p not in seen:
-            seen.add(p)
-            deduped.append(p)
-
-    # If nothing resolved, keep a safe hourly default
-    if not deduped:
-        api_key = "hourly"
-        deduped = ["temperature_2m"]
-        warnings.append("No variables recognized; defaulting to hourly temperature_2m.")
-
-    return api_key, deduped, warnings
-
-def _auto_time_params(start_date: str, end_date: str, api_key: str, now_local: datetime) -> Dict[str, Any]:
-    # explicit dates are predictable for both endpoints
-    return {"start_date": start_date, "end_date": end_date}
-
-def _merge_series(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    if not a: return b or {}
-    if not b: return a or {}
-    time_key = "time"
-    out: Dict[str, Any] = {}
-    out[time_key] = (a.get(time_key) or []) + (b.get(time_key) or [])
-    keys = set(a.keys()).union(b.keys())
-    keys.discard(time_key)
-    for k in keys:
-        out[k] = (a.get(k) or []) + (b.get(k) or [])
-    return out
+        r = requests.get(url, params=params, timeout=30)
+        payload = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        return {"status": r.status_code, "url": r.url, "payload": payload}
+    except Exception as e:
+        return {"status": 599, "url": f"{url}?<params>", "payload": {"error": str(e)}}
 
 @FunctionTool
 def fetch_openmeteo(
     lat: float,
     lon: float,
-    start_date: str,
-    end_date: str,
-    variables: List[str],
-    granularity: str = "auto",    # 'auto' | 'daily' | 'hourly' | 'minutely_15' | 'current'
-    time_mode: str = "",          # 'hindcast' | 'forecast' | 'mixed' | ''
-    time_hint: str = "none",      # 'none' | 'clock' | 'quarter_hour'
-    tz_mode: str = "auto",        # 'auto' or TZ like 'America/Los_Angeles'
-    models: List[str] | None = None,
+    # Let the LLM decide the scenario via time_mode:
+    #   "current"          → current weather now (optionally with an hourly context stream)
+    #   "hindcast_recent"  → recent past using ?past_days (MUST be ≤5)
+    #   "archive_2021"     → older dates via ERA5 (dates must be inside 2021)
+    time_mode: str,
+    # Variables are canonical names (e.g., "temperature_2m", "precipitation", "wind_speed_10m", ...)
+    canonical_variables: List[str],
+    # "hourly" or "daily" depending on what the LLM wants to analyze/return
+    granularity: str = "hourly",
+    # For hindcast_recent (recommended): number of days back from *today*, inclusive (1..5)
+    lookback_days: int = 0,
+    # For archive_2021 (required): explicit window (must be within 2021)
+    start_date: str = "",
+    end_date: str = "",
+    # Optional: timezone hint. If empty -> UTC for hourly, auto for daily/current
+    timezone: str = "",
 ) -> Dict[str, Any]:
-    # Guard coords
-    if not (_safe_float(lat, -90, 90) and _safe_float(lon, -180, 180)):
-        return {"error": "Invalid coordinates"}
+    """
+    Minimal, opinionated router to Open-Meteo endpoints.
 
-    picked_gran = _pick_granularity(granularity, time_hint)
-    api_key, var_list, var_warnings = _map_vars(variables, picked_gran)
+    Rules:
+      1) time_mode == "current"
+         → GET /v1/forecast with current=<vars> and (optionally) hourly=<vars> for context.
+      2) time_mode == "hindcast_recent" and lookback_days ∈ [1..5]
+         → GET /v1/forecast with past_days=lookback_days and hourly|daily=<vars>.
+      3) time_mode == "archive_2021"
+         → GET /v1/archive with start_date/end_date and hourly|daily=<vars>. Dates must be fully in 2021.
 
-    today = date.today()
-    s = date.fromisoformat(start_date)
-    e = date.fromisoformat(end_date)
+    Strictness:
+      - Prevents hourly/daily mismatches (e.g., no "hourly=precipitation_sum").
+      - If inputs violate these rules, returns {"error": "..."} with no network call.
 
-    # Decide endpoint(s). If caller didn’t force time_mode, infer:
-    if not time_mode:
-        if e < today:
-            time_mode = "hindcast"     # strictly past → archive
-        elif s > today:
-            time_mode = "forecast"     # strictly future → forecast
-        else:
-            time_mode = "mixed"        # spans past↔future → split calls
+    Returns:
+      {
+        "payload": <Open-Meteo JSON>,
+        "request": { ... echoed inputs & resolved params ... },
+        "api_urls": ["<full url>"]
+      }
+    """
+    # ---- Normalize
+    lat = float(lat); lon = float(lon)
+    time_mode = (time_mode or "").strip().lower()
+    granularity = (granularity or "hourly").strip().lower()
+    tz = timezone.strip() or ("UTC" if granularity == "hourly" else "auto")
 
-    tz_value = "auto" if tz_mode == "auto" else tz_mode
+    # ---- Strict variable mapping (raises if mismatched)
+    try:
+        api_param = _strict_map(canonical_variables, granularity)
+    except Exception as e:
+        return {"error": f"Variable mapping error: {e}"}
 
-    def _call(endpoint: str, s_date: date, e_date: date) -> Dict[str, Any]:
-        # Clamp forecast horizon to avoid silent truncation errors
-        _s, _e = s_date, e_date
-        if endpoint == _FORECAST:
-            _s, _e = _clamp_forecast_range(_s, _e, today)
-
-        params = {
-            "latitude": float(lat),
-            "longitude": float(lon),
-            "timezone": tz_value,
-        }
-        params.update(_auto_time_params(_s.isoformat(), _e.isoformat(), api_key, datetime.utcnow()))
-        params[api_key] = ",".join(var_list)
-        if models:
-            params["models"] = ",".join(models)
-
-        r = requests.get(endpoint, params=params, timeout=30)
-        r.raise_for_status()
-        js = r.json() if hasattr(r, "json") else {}
-        # Pick the block that matches our cadence
-        block = js.get(api_key) or {}
-        units = js.get(f"{api_key}_units") or {}
-
-        return {"block": block, "units": units, "raw": js, "endpoint": endpoint, "params": params}
-
-    # Perform calls based on time_mode
-    units: Dict[str, Any] = {}
-    block: Dict[str, Any] = {}
-    data: Dict[str, Any] = {}
-    sources: List[str] = []
-
-    if time_mode == "hindcast":
-        sources = ["archive"]
-        a = _call(_ARCHIVE, s, e)
-        units.update(a["units"])
-        block = a["block"]
-        data["archive_raw"] = a["raw"]
-    elif time_mode == "forecast":
-        sources = ["forecast"]
-        b = _call(_FORECAST, s, e)
-        units.update(b["units"])
-        block = b["block"]
-        data["forecast_raw"] = b["raw"]
-    else:  # mixed
-        sources = ["archive", "forecast"]
-        if s < today:
-            past_end = min(e, today - timedelta(days=1))
-            a = _call(_ARCHIVE, s, past_end)
-            units.update(a["units"])
-            block = _merge_series(block, a["block"])
-            data["archive_raw"] = a["raw"]
-        if e >= today:
-            fut_start = max(today, s)
-            b = _call(_FORECAST, fut_start, e)
-            units.update(b["units"])
-            block = _merge_series(block, b["block"])
-            data["forecast_raw"] = b["raw"]
-
-    # Success payload
-    resp: Dict[str, Any] = {
-        "source": "+".join(sources),
-        "endpoint_mode": time_mode,
-        "granularity": api_key,
-        "endpoint_urls": {
-            "forecast": _FORECAST if "forecast" in sources else "",
-            "archive": _ARCHIVE if "archive" in sources else "",
-        },
-        "request": {
-            "latitude": float(lat),
-            "longitude": float(lon),
-            "start_date": s.isoformat(),
-            "end_date": e.isoformat(),
-            api_key: ",".join(var_list),
-            "timezone": tz_value,
-            **({"models": ",".join(models)} if models else {}),
-        },
-        "units": units,
-        "data": {api_key: block, f"{api_key}_units": units},
+    # ---- Build by scenario
+    api_urls: List[str] = []
+    req_meta: Dict[str, Any] = {
+            "time_mode": time_mode,
+        "lat": lat, "lon": lon,
+        "granularity": granularity,
+        "variables": canonical_variables,
+        "resolved_param": api_param,
+        "timezone": tz,
     }
-    if var_warnings:
-        resp["warnings"] = var_warnings
-    return resp
+
+    if time_mode == "current":
+        # Example target:
+        # /v1/forecast?latitude=..&longitude=..&current=temperature_2m,...&hourly=temperature_2m,...
+        # Keep 'current' subset to variables that are typically supported as current values.
+        CURRENT_OK = {
+            "temperature_2m", "wind_speed_10m", "relative_humidity_2m",
+            "cloud_cover", "precipitation"
+        }
+        current_vars = [v for v in canonical_variables if v in CURRENT_OK]
+        params: Dict[str, Any] = {
+            "latitude": lat, "longitude": lon,
+            "timezone": "auto",  # current is local by nature
+        }
+        if current_vars:
+            params["current"] = ",".join(current_vars)
+        # Optional hourly context stream with same vars (strict-mapped)
+        params["hourly"] = api_param if granularity == "hourly" else None
+        # prune None
+        params = {k: v for k, v in params.items() if v}
+
+        got = _get(FORECAST_URL, params)
+        api_urls.append(got["url"])
+        if got["status"] != 200:
+            return {"error": f"Open-Meteo error {got['status']}", "api_urls": api_urls, "request": req_meta}
+        return {"payload": got["payload"], "request": req_meta, "api_urls": api_urls}
+
+    elif time_mode == "hindcast_recent":
+        # Must be 1..5 days
+        if not (1 <= int(lookback_days) <= 5):
+            return {"error": "hindcast_recent requires lookback_days in [1..5]. Use archive_2021 for older dates."}
+        params: Dict[str, Any] = {
+            "latitude": lat, "longitude": lon,
+            "past_days": int(lookback_days),
+            "timezone": tz,
+        }
+        if granularity == "hourly":
+            params["hourly"] = api_param
+        else:
+            params["daily"] = api_param
+
+        got = _get(FORECAST_URL, params)
+        api_urls.append(got["url"])
+        if got["status"] != 200:
+            return {"error": f"Open-Meteo error {got['status']}", "api_urls": api_urls, "request": req_meta}
+        # Record the effective window for display convenience
+        today = _dt.date.today()
+        s_eff = (today - _dt.timedelta(days=int(lookback_days) - 1)).isoformat()
+        e_eff = today.isoformat()
+        req_meta.update({"start_date": s_eff, "end_date": e_eff, "past_days": int(lookback_days)})
+        return {"payload": got["payload"], "request": req_meta, "api_urls": api_urls}
+
+    elif time_mode == "archive_2021":
+        # Must provide explicit 2021 window
+        if not (start_date and end_date):
+            return {"error": "archive_2021 requires start_date and end_date (YYYY-MM-DD)."}
+        try:
+            s = _dt.date.fromisoformat(start_date)
+            e = _dt.date.fromisoformat(end_date)
+        except Exception:
+            return {"error": "Invalid start_date/end_date; expected YYYY-MM-DD."}
+        if not (s.year == 2021 and e.year == 2021 and s <= e):
+            return {"error": "Only dates fully inside 2021 are supported for ERA5 in this app."}
+
+        params: Dict[str, Any] = {
+            "latitude": lat, "longitude": lon,
+            "start_date": s.isoformat(), "end_date": e.isoformat(),
+            "timezone": tz,
+        }
+        if granularity == "hourly":
+            params["hourly"] = api_param
+        else:
+            params["daily"] = api_param
+
+        got = _get(ERA5_URL, params)
+        api_urls.append(got["url"])
+        if got["status"] != 200:
+            return {"error": f"Open-Meteo error {got['status']}", "api_urls": api_urls, "request": req_meta}
+        req_meta.update({"start_date": s.isoformat(), "end_date": e.isoformat()})
+        return {"payload": got["payload"], "request": req_meta, "api_urls": api_urls}
+
+    else:
+        # Keep it explicit: we only support the three scenarios you described.
+        return {"error": "Unsupported time_mode. Use one of: 'current', 'hindcast_recent', 'archive_2021'."}
+

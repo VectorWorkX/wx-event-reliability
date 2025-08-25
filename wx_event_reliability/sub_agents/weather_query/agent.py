@@ -21,7 +21,6 @@ from . import prompt
 
 # Import function tools (must be FunctionTool-decorated in your tools package)
 from ..tools.geocode import geocode_place
-from ..tools.date_parse import infer_time_window
 from ..tools.variables import pick_variables
 from ..tools.model_hint import detect_model_hint
 from ..tools.openmeteo import fetch_openmeteo
@@ -41,7 +40,6 @@ weather_query_agent = Agent(
     output_key="final_answer",
     tools=[
         geocode_place,
-        infer_time_window,
         pick_variables,
         detect_model_hint,
         fetch_openmeteo,
