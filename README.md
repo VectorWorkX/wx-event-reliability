@@ -15,17 +15,10 @@ It dynamically interprets **locations**, **time windows**, and **variables**, ch
 ---
 
 ## 🧩 System Architecture
-'''
-user query → weather_coordinator (Gemini-2.5-pro)
-├── weather_query_agent
-│   ├── geocode_place() → lat/lon, timezone
-│   ├── pick_variables() → temperature_2m, precipitation, etc.
-│   ├── detect_model_hint() → GFS / ECMWF / ERA5 / ICON
-│   ├── fetch_openmeteo() → dynamic endpoint selection
-│   └── summarise_weather() → concise, unit-aware answer
-└── physics_rag_agent (optional)
-    └── Vertex AI RAG Retrieval → physics mechanism note
-'''
+
+<pre> user query → weather_coordinator (Gemini-2.5-pro) ├── weather_query_agent │ ├── geocode_place() → lat/lon, timezone │ ├── pick_variables() → temperature_2m, precipitation, etc. │ ├── detect_model_hint() → GFS / ECMWF / ERA5 / ICON │ ├── fetch_openmeteo() → dynamic endpoint selection │ └── summarise_weather() → concise, unit-aware answer └── physics_rag_agent (optional) └── Vertex AI RAG Retrieval → physics mechanism note </pre>
+
+Each agent runs under Google ADK, exposing standardized AgentTool / FunctionTool interfaces for deterministic chaining and reproducible outputs.
 
 
 Each agent runs under **Google ADK**, exposing standardized `AgentTool` / `FunctionTool` interfaces for deterministic chaining and reproducible outputs.
